@@ -69,5 +69,8 @@ class ChatResponse(BaseModel):
     source: ResponseSource
     citations: list[Citation] = Field(default_factory=list)
     action: Optional[ActionResult] = None
-    guardrail_triggered: bool = False
+    guardrail_triggered: list[str] = Field(
+        default_factory=list,
+        description="Guardrails activados; lista vacía si no se activó ninguno",
+    )
     requires_human: bool = False
