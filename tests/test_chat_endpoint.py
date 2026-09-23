@@ -2,10 +2,12 @@
 
 - Tests offline: lógica del pipeline con dobles (sin red).
 - Tests de integración: API real de Groq + índice real de embeddings. Se saltan si no hay
-  GROQ_API_KEY. Cada pregunta se envía una sola vez por corrida (respuestas cacheadas).
+  GROQ_API_KEY. Cada pregunta se envía una sola vez por corrida (respuestas cacheadas), con
+  una pausa entre llamadas para no superar el límite de tokens por minuto de Groq.
 """
 
 import re
+import time
 import unicodedata
 
 import pytest
@@ -34,7 +36,10 @@ from app.guardrails.response_validators import (
     AUTH_CHANNEL_RETRY_INSTRUCTION,
     DESCRIBES_AUTH_CHANNEL,
     GUARDRAIL_AUTH_CHANNEL,
+    GUARDRAIL_PHONE_KEY_OUTSIDE_BLOCK,
+    GUARDRAIL_SENSITIVE_DATA,
 )
+from app.guardrails.faithfulness import FAITHFULNESS_UNVERIFIED, GUARDRAIL_UNSUPPORTED_CLAIM
 from app.orchestrator.pipeline import FALLBACK_ANSWER, OUT_OF_SCOPE_ANSWER, ChatPipeline
 from app.rag.retriever import RetrievedChunk
 from tests.test_classifier_manual import QUESTIONS
@@ -227,20 +232,29 @@ requires_groq = pytest.mark.skipif(
 )
 
 
+INTEGRATION_PAUSE_SECONDS = 20
+
+
 @pytest.fixture(scope="module")
 def live():
     real = get_pipeline()
     retriever = SpyRetriever(inner=real._retriever)
     generator = SpyGenerator(inner=real._generator)
-    pipeline = ChatPipeline(retriever, generator, classifier_llm=real._classifier_llm)
+    pipeline = ChatPipeline(retriever, generator, classifier_llm=real._classifier_llm, verifier=real._verifier)
     app.dependency_overrides[get_pipeline] = lambda: pipeline
     client = TestClient(app)
     cache: dict[str, dict] = {}
     calls: dict[str, tuple[int, int]] = {}
+    sent = {"count": 0}
 
     def ask(question: str, fresh: bool = False) -> dict:
         """Envía la pregunta; con fresh=True no usa la caché (nueva llamada a Groq)."""
         if fresh or question not in cache:
+            if sent["count"]:
+                # Plan gratuito de Groq: 8.000 tokens por minuto; cada pregunta hace de 3 a 5
+                # llamadas (clasificación, generación, verificador y reintentos).
+                time.sleep(INTEGRATION_PAUSE_SECONDS)
+            sent["count"] += 1
             before = (retriever.calls, generator.calls)
             response = client.post("/api/v1/chat", json={"session_id": "test", "message": question})
             assert response.status_code == 200, response.text
@@ -259,18 +273,47 @@ def _citation_ids(body: dict) -> list[str]:
     return [c["chunk_id"] for c in body["citations"]]
 
 
+KNOWN_GUARDRAILS = {
+    GUARDRAIL_SENSITIVE_DATA,
+    GUARDRAIL_PHONE_KEY_OUTSIDE_BLOCK,
+    GUARDRAIL_AUTH_CHANNEL,
+    GUARDRAIL_UNSUPPORTED_CLAIM,
+    FAITHFULNESS_UNVERIFIED,
+}
+
+
 @requires_groq
 @pytest.mark.parametrize("question", QUESTIONS)
 def test_contract_for_base_questions(live, question):
+    # Contrato del payload. Que un guardrail corrija una respuesta es un resultado válido, así
+    # que no se exige guardrail_triggered vacío: solo que traiga nombres conocidos.
     body = live(question)
     assert body["session_id"] == "test"
     assert body["answer"].strip()
     assert body["action"] is None
-    assert body["guardrail_triggered"] == []
+    assert set(body["guardrail_triggered"]) <= KNOWN_GUARDRAILS, body["guardrail_triggered"]
     if body["source"] == "kb":
         assert body["citations"], "una respuesta de la KB debe traer citations"
     else:
         assert body["source"] == "static" and body["citations"] == []
+        assert body["guardrail_triggered"] == [], "un mensaje fijo sin RAG no pasa por guardrails"
+
+
+# Preguntas cuyas respuestas se confirmaron fieles contra Groq real (diagnóstico de los falsos
+# positivos del verificador): una respuesta correcta no debe disparar guardrails innecesarios.
+FAITHFUL_REFERENCE_QUESTIONS = [
+    "me robaron la tarjeta con violencia",
+    "me llegó un correo pidiendo mi CVV",
+    "perdí mi tarjeta, ¿me pueden desactivar?",
+]
+
+
+@requires_groq
+@pytest.mark.parametrize("question", FAITHFUL_REFERENCE_QUESTIONS)
+def test_faithful_reference_answers_do_not_trigger_guardrails(live, question):
+    body = live(question)
+    assert body["source"] == "kb"
+    assert body["guardrail_triggered"] == [], (body["guardrail_triggered"], body["answer"])
 
 
 @requires_groq

@@ -129,7 +129,19 @@ _SENSITIVE = (
     r"|numero completo de (?:tu|su|la|mi) tarjeta|numero de (?:tu|su) tarjeta completo"
     r"|(?:los\s+)?16 digitos)"
 )
-_MENTIONS_SENSITIVE = re.compile(_SENSITIVE)
+# El cliente pide un dato sensible propio al banco ("cuál es mi CVV", "dime mi PAN", "dame el
+# número completo de mi tarjeta"). Verbos en primera persona dirigidos al banco; no incluye
+# lo que hizo un tercero ("me pidieron mi clave", "un correo pidiendo mi CVV") ni preguntas
+# sobre la política ("¿ustedes me van a pedir mi CVV?").
+_CLIENT_ASKS_OWN_SENSITIVE = re.compile(
+    r"\b(?:"
+    r"cual(?:es)? (?:es|son)|dime|dimelo|digame|dame|deme|damelo|mandame|enviame|envienme|recuerdame"
+    r"|me (?:das|da|dan|dices|dice|dicen|envias|envia|envian|mandas|manda|mandan)"
+    r"|me (?:puedes|puede|pueden|podrias|podria|podrian) (?:dar|decir|enviar|mandar|recordar)"
+    r"|(?:quiero|necesito|quisiera) (?:saber|ver|conocer|consultar|recordar|que me (?:den|digan|envien))"
+    r"|como (?:veo|consulto|obtengo|recupero)|donde (?:veo|encuentro|consulto)"
+    rf")\b[^.!?;\n]{{0,30}}?{_SENSITIVE}"
+)
 
 # Solicitudes dirigidas al cliente: imperativos, "necesito/requerimos" y "¿puede indicar...?".
 # Los subjuntivos negativos ("no compartas", "nunca te pediremos") no están en la lista.
@@ -210,11 +222,36 @@ def extract_shared_secrets(user_message: str) -> SharedSecrets:
     return SharedSecrets(strict=frozenset(strict), bare=frozenset(bare))
 
 
-def client_involved_sensitive_data(user_message: str) -> bool:
-    """El cliente escribió un dato sensible o preguntó por uno ("cuál es mi CVV")."""
-    return bool(extract_shared_secrets(user_message).all) or bool(
-        _MENTIONS_SENSITIVE.search(_prepare(user_message))
+def client_shares_sensitive_data(user_message: str) -> bool:
+    """Caso 1: el cliente escribió un dato sensible ("mi clave es 4521", "mi CVV es 123")."""
+    return bool(extract_shared_secrets(user_message).all)
+
+
+_FIRST_PERSON_POSSESSIVE = re.compile(r"\bmis?\b")
+
+
+def client_asks_own_sensitive_data(user_message: str) -> bool:
+    """Caso 2: el cliente pide un dato sensible propio ("cuál es mi CVV", "dime mi PAN").
+
+    Exige "mi/mis" en la solicitud o justo después ("el código de seguridad de mi tarjeta"):
+    distingue el pedido propio de una cita del estafador ("un SMS que decía dame tu PIN").
+    """
+    text = _prepare(user_message)
+    return any(
+        _FIRST_PERSON_POSSESSIVE.search(text, m.start(), m.end() + 20)
+        for m in _CLIENT_ASKS_OWN_SENSITIVE.finditer(text)
     )
+
+
+def client_involved_sensitive_data(user_message: str) -> bool:
+    """Si el texto fijo debe ser el rechazo categórico: el cliente compartió (caso 1) o pidió
+    (caso 2) un dato sensible.
+
+    Caso 3, NO cuenta: el cliente solo menciona que un tercero le pidió el dato ("me llegó un
+    correo pidiendo mi CVV", "me pidieron mi clave por teléfono"). Es un reporte de phishing
+    legítimo: el texto fijo es el siguiente paso del flujo (flow_next_step), no un rechazo.
+    """
+    return client_shares_sensitive_data(user_message) or client_asks_own_sensitive_data(user_message)
 
 
 def requests_or_reveals_sensitive_data(
@@ -262,31 +299,59 @@ SENSITIVE_DATA_RETRY_INSTRUCTION = (
 
 _NEVER_SHARE = "Nunca compartas tu CVV, tu clave completa ni el número completo de tu tarjeta."
 
-# El cliente escribió o pidió un dato sensible: rechazo categórico.
+# El cliente compartió o pidió un dato sensible (client_involved_sensitive_data): rechazo categórico.
 SENSITIVE_DATA_FALLBACK_ANSWER = (
     "No puedo solicitar ni confirmar ese dato por este canal, bajo ninguna circunstancia. " + _NEVER_SHARE
 )
-# El problema lo originó el modelo (el cliente no escribió ni pidió nada sensible): texto que
-# además indica cómo seguir, según lo que la política permite pedir en ese flujo.
+# En otro caso (el problema lo originó el modelo, o el cliente solo contó que un tercero le
+# pidió el dato): texto que indica cómo seguir, según lo que la política permite pedir.
 MODEL_FALLBACK_BLOCK = (
     "Para continuar, necesito tu documento de identidad y tu clave telefónica. " + _NEVER_SHARE
 )  # Flujos que admiten la clave telefónica (allows_phone_key; POL-BLQ-2026-1).
 MODEL_FALLBACK_DOCUMENT_ONLY = (
     "Para continuar, necesito tu documento de identidad. " + _NEVER_SHARE
 )  # Phishing, con o sin bloqueo: identidad limitada, solo documento (POL-SEG-2026-2).
+# Flujos donde la política no indica datos a pedir: sin pedir ninguno, pero con un siguiente
+# paso concreto respaldado por la KB.
+MODEL_FALLBACK_FRAUD = (
+    "Puedo derivarte con un asesor para registrar el reporte de la transacción que no reconoces. "
+    + _NEVER_SHARE
+)
+MODEL_FALLBACK_NEW_CARD = "Puedo derivarte con un asesor para gestionar la reposición de tu tarjeta. " + _NEVER_SHARE
+MODEL_FALLBACK_UNBLOCK = (
+    "El desbloqueo de tarjetas no se realiza por este canal: puedes solicitarlo por banca telefónica "
+    "o en atención presencial. " + _NEVER_SHARE
+)  # POL-BLQ-2026-5: no se captura ningún dato; se deriva a esos canales.
 MODEL_FALLBACK_NO_DATA = (
     _NEVER_SHARE + " Si necesitas más ayuda, puedo derivarte con un asesor."
-)  # Resto: la política no indica datos a pedir; en desbloqueo no se captura ninguno (POL-BLQ-2026-5).
+)  # Combinaciones sin un siguiente paso único.
+
+_NO_DATA_BY_INTENT = {
+    Intent.REPORTAR_FRAUDE: MODEL_FALLBACK_FRAUD,
+    Intent.SOLICITAR_TARJETA_NUEVA: MODEL_FALLBACK_NEW_CARD,
+    Intent.DESBLOQUEAR_TARJETA: MODEL_FALLBACK_UNBLOCK,
+}
+
+
+def flow_next_step(intents: Intents) -> str:
+    """Texto fijo con el siguiente paso según lo que la política permite pedir en el flujo.
+
+    Todos incluyen la advertencia de no compartir CVV/clave completa/PAN y ninguno repite un
+    dato del cliente, así que cumplen el guardrail sensible en cualquier caso.
+    """
+    if allows_phone_key(intents):
+        return MODEL_FALLBACK_BLOCK
+    if Intent.REPORTAR_INTENTO_PHISHING in intents:
+        return MODEL_FALLBACK_DOCUMENT_ONLY
+    if len(intents) == 1:
+        return _NO_DATA_BY_INTENT.get(next(iter(intents)), MODEL_FALLBACK_NO_DATA)
+    return MODEL_FALLBACK_NO_DATA
 
 
 def sensitive_data_fallback(user_message: str, intents: Intents) -> str:
     if client_involved_sensitive_data(user_message):
         return SENSITIVE_DATA_FALLBACK_ANSWER
-    if allows_phone_key(intents):
-        return MODEL_FALLBACK_BLOCK
-    if Intent.REPORTAR_INTENTO_PHISHING in intents:
-        return MODEL_FALLBACK_DOCUMENT_ONLY
-    return MODEL_FALLBACK_NO_DATA
+    return flow_next_step(intents)
 
 
 sensitive_data_stats = GuardrailStats(GUARDRAIL_SENSITIVE_DATA)

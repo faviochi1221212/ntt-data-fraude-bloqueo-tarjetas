@@ -2,6 +2,7 @@ from functools import lru_cache
 
 from fastapi import APIRouter, Depends
 
+from app.guardrails.faithfulness import FaithfulnessVerifierError, GroqFaithfulnessVerifier
 from app.models.schemas import ChatRequest, ChatResponse
 from app.orchestrator.classifier import GroqClassifier, LLMClassifierError
 from app.orchestrator.generator import GroqGenerator
@@ -19,10 +20,16 @@ def get_pipeline() -> ChatPipeline:
     except LLMClassifierError:
         # classify() reintenta construirlo y reporta el motivo en llm_error.
         classifier_llm = None
+    try:
+        verifier = GroqFaithfulnessVerifier()
+    except FaithfulnessVerifierError:
+        # Sin key la generación tampoco funciona; el pipeline responde con su fallback.
+        verifier = None
     return ChatPipeline(
         retriever=build_retriever(),
         generator=GroqGenerator(),
         classifier_llm=classifier_llm,
+        verifier=verifier,
     )
 
 

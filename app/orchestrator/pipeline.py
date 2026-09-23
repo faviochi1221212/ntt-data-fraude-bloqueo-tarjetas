@@ -14,6 +14,7 @@ from app.models.schemas import (
     Intent,
     ResponseSource,
 )
+from app.guardrails.faithfulness import FAITHFULNESS_UNVERIFIED, FaithfulnessGuard, FaithfulnessVerifier
 from app.guardrails.response_validators import RESPONSE_GUARDRAILS_BY_SEVERITY
 from app.orchestrator.classifier import LLMClassifier, classify
 from app.orchestrator.generator import GenerationError
@@ -78,11 +79,14 @@ class ChatPipeline:
         generator: Generator,
         classifier_llm: Optional[LLMClassifier] = None,
         classify_fn: Callable[..., ClassificationResult] = classify,
+        verifier: Optional[FaithfulnessVerifier] = None,
     ):
         self._retriever = retriever
         self._generator = generator
         self._classifier_llm = classifier_llm
         self._classify = classify_fn
+        # Sin verificador (p. ej. tests offline que no lo inyectan) no corre el guardrail de fidelidad.
+        self._verifier = verifier
 
     def handle(self, request: ChatRequest) -> ChatResponse:
         result = self._classify(request.message, llm=self._classifier_llm)
@@ -133,25 +137,59 @@ class ChatPipeline:
         2. auth_channel_disclosure (salida, todos los intents).
         3. phone_key_outside_block (salida, donde el flujo no admite la clave telefónica:
            not allows_phone_key(intents), es decir sin bloqueo o con phishing).
-        4. sensitive_data_request (salida, todos los intents): corre al final, como última
-           barrera antes de responder.
+        4. sensitive_data_request (salida, todos los intents).
+        5. unsupported_claim (salida, solo si hay chunks y verificador): fidelidad al contenido
+           de los chunks citados, con un segundo LLM. Corre al final porque es el más caro
+           (una llamada al LLM) y así verifica la respuesta que ya pasó los guardrails de
+           patrones; si pide un reintento, ese reintento igual se revalida contra todos.
 
-        Jerarquía de severidad (RESPONSE_GUARDRAILS_BY_SEVERITY), de mayor a menor:
+        Jerarquía de severidad, de mayor a menor (decide el texto fijo):
         datos sensibles (CVV/PAN/clave completa) > clave telefónica fuera de bloqueo >
-        canal de autenticación > el resto. La ejecución va en orden inverso para que el más
-        severo sea la última barrera.
+        canal de autenticación > afirmación sin respaldo (fidelidad) > el resto.
+        Los tres primeros están en RESPONSE_GUARDRAILS_BY_SEVERITY; fidelidad se agrega por
+        petición porque depende de los chunks recuperados.
 
         Revalidación cruzada: cada guardrail que detecta un problema pide UN reintento, y la
         respuesta regenerada se valida contra TODOS los guardrails que aplican a esos intents,
         no solo contra el que la originó (un reintento puede corregir un problema e introducir
-        otro). Si la regenerada viola cualquiera, se usa el texto fijo del guardrail más severo
-        entre los involucrados (el que originó el reintento y los que violó la regenerada), y
-        todos ellos se reportan en guardrail_triggered. El texto fijo depende de los intents y
-        de si el dato sensible lo introdujo el cliente o el modelo (ver response_validators).
-        """
-        applicable = [g for g in RESPONSE_GUARDRAILS_BY_SEVERITY if g.applies(intents)]
+        otro, incluida una afirmación sin respaldo). Si la regenerada viola cualquiera, se usa el
+        texto fijo del guardrail más severo entre los involucrados (el que originó el reintento
+        y los que violó la regenerada), y todos ellos se reportan en guardrail_triggered. El
+        texto fijo depende de los intents y de si el dato sensible lo introdujo el cliente o el
+        modelo (ver response_validators).
 
-        for guardrail in reversed(applicable):  # Ejecución: el más severo al final.
+        Si el verificador de fidelidad falla (API o veredicto inválido) en cualquier momento de
+        la petición, la respuesta generada se bloquea (fail-closed): se reemplaza por el texto
+        fijo "no verificada" (siguiente paso según el flujo, distinto del texto de alucinación
+        detectada) y se agrega faithfulness_unverified a guardrail_triggered. Si la
+        respuesta ya era el texto fijo de otro guardrail (no generado), se mantiene y solo se
+        agrega la marca.
+        """
+        pattern_guardrails = [g for g in RESPONSE_GUARDRAILS_BY_SEVERITY if g.applies(intents)]
+        faithfulness = FaithfulnessGuard(self._verifier, chunks) if self._verifier and chunks else None
+        faithfulness_guardrails = [faithfulness.guardrail] if faithfulness else []
+
+        applicable = pattern_guardrails + faithfulness_guardrails  # Por severidad, de mayor a menor.
+        execution_order = list(reversed(pattern_guardrails)) + faithfulness_guardrails
+
+        answer, triggered = self._run_guardrails(message, chunks, answer, intents, applicable, execution_order)
+        if faithfulness and faithfulness.unverified:
+            if not triggered:  # La respuesta es generada y no se pudo verificar: se bloquea.
+                faithfulness.guardrail.stats.record_fallback("el verificador falló; respuesta bloqueada")
+                answer = faithfulness.unverified_fallback(message, intents)
+            triggered.append(FAITHFULNESS_UNVERIFIED)
+        return answer, triggered
+
+    def _run_guardrails(
+        self,
+        message: str,
+        chunks: list[RetrievedChunk],
+        answer: str,
+        intents: frozenset,
+        applicable: list,
+        execution_order: list,
+    ) -> tuple[str, list[str]]:
+        for guardrail in execution_order:
             guardrail.stats.record_check()
             if not guardrail.detect(answer, message, intents):
                 continue

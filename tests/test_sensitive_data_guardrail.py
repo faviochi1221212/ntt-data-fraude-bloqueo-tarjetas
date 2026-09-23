@@ -14,17 +14,24 @@ from app.guardrails.response_validators import (
     GUARDRAIL_SENSITIVE_DATA,
     MODEL_FALLBACK_BLOCK,
     MODEL_FALLBACK_DOCUMENT_ONLY,
+    MODEL_FALLBACK_FRAUD,
+    MODEL_FALLBACK_NEW_CARD,
     MODEL_FALLBACK_NO_DATA,
+    MODEL_FALLBACK_UNBLOCK,
     PHONE_KEY_OUTSIDE_BLOCK_GUARDRAIL,
     PHONE_KEY_RETRY_INSTRUCTION,
     RESPONSE_GUARDRAILS_BY_SEVERITY,
     SENSITIVE_DATA_FALLBACK_ANSWER,
     SENSITIVE_DATA_RETRY_INSTRUCTION,
     allows_phone_key,
+    client_asks_own_sensitive_data,
+    client_involved_sensitive_data,
+    client_shares_sensitive_data,
     describes_auth_channel,
     extract_shared_secrets,
     requests_or_reveals_sensitive_data,
     requests_phone_key,
+    flow_next_step,
     sensitive_data_fallback,
 )
 from app.models.schemas import ChatRequest, Intent
@@ -184,9 +191,10 @@ def test_auth_channel_detector(answer, expected):
         ("perdí mi tarjeta, quiero una nueva", BLOCK_NEW_CARD, MODEL_FALLBACK_BLOCK),
         ("me llegó un correo raro", PHISHING, MODEL_FALLBACK_DOCUMENT_ONLY),
         ("me llegó un correo raro", PHISHING_BLOCK, MODEL_FALLBACK_DOCUMENT_ONLY),
-        ("no reconozco un cargo", FRAUD, MODEL_FALLBACK_NO_DATA),
-        ("quiero una tarjeta nueva", NEW_CARD, MODEL_FALLBACK_NO_DATA),
-        ("quiero desbloquear mi tarjeta", UNBLOCK, MODEL_FALLBACK_NO_DATA),
+        ("no reconozco un cargo", FRAUD, MODEL_FALLBACK_FRAUD),
+        ("quiero una tarjeta nueva", NEW_CARD, MODEL_FALLBACK_NEW_CARD),
+        ("quiero desbloquear mi tarjeta", UNBLOCK, MODEL_FALLBACK_UNBLOCK),
+        ("no reconozco un cargo y quiero una nueva", FRAUD | NEW_CARD, MODEL_FALLBACK_NO_DATA),
         ("cuál es mi CVV", PHISHING, SENSITIVE_DATA_FALLBACK_ANSWER),
         (SHARED_KEY_MESSAGE, BLOCK, SENSITIVE_DATA_FALLBACK_ANSWER),
     ],
@@ -312,7 +320,7 @@ def test_channel_guardrail_outside_block_uses_generic_retry_and_no_phone_key_fal
     )
     response = pipeline.handle(ChatRequest(session_id="s", message="no reconozco un cargo"))
     assert generator.corrections == [None, AUTH_CHANNEL_RETRY_INSTRUCTION_GENERIC]
-    assert response.answer == MODEL_FALLBACK_NO_DATA
+    assert response.answer == MODEL_FALLBACK_FRAUD
     assert response.guardrail_triggered == [GUARDRAIL_AUTH_CHANNEL]
 
 
@@ -360,7 +368,7 @@ def test_cross_revalidation_sensitive_retry_that_asks_phone_key_outside_block():
     # Casos reales observados en fraude/reposición: el reintento pide la clave telefónica.
     pipeline, _ = _pipeline(ASKS_CVV, ASKS_PHONE_KEY, intents=(Intent.REPORTAR_FRAUDE,))
     response = pipeline.handle(ChatRequest(session_id="s", message="no reconozco un cargo"))
-    assert response.answer == MODEL_FALLBACK_NO_DATA
+    assert response.answer == MODEL_FALLBACK_FRAUD
     assert response.guardrail_triggered == [GUARDRAIL_SENSITIVE_DATA, GUARDRAIL_PHONE_KEY_OUTSIDE_BLOCK]
 
 
@@ -389,3 +397,74 @@ def test_cross_revalidation_accepts_retry_that_passes_everything():
     assert generator.calls == 2
     assert response.answer == CLEAN
     assert response.guardrail_triggered == []
+
+
+# --- Rechazo categórico: comparte / pide / menciona que se lo pidieron ------------------
+
+SHARES = [
+    "mi clave es 4521, ayúdame a bloquear mi tarjeta",
+    "mi CVV es 123",
+    "mi tarjeta es 4111 1111 1111 1111",
+    "me pidieron mi cvv y les di 123",  # Menciona al tercero, pero además lo compartió.
+]
+ASKS_OWN = [
+    "cuál es mi CVV",
+    "dime mi PAN",
+    "dame el número completo de mi tarjeta para verificar",
+    "¿me pueden dar el código de seguridad de mi tarjeta?",
+    "quiero saber mi clave de banca por internet completa",
+]
+MENTIONS_THIRD_PARTY = [
+    "me llegó un correo pidiendo mi CVV",
+    "me pidieron mi clave por teléfono",
+    "me robaron y también me pidieron mi clave por teléfono después",
+    "alguien me llamó del banco pidiéndome el número completo de mi tarjeta",
+    "¿ustedes me van a pedir mi CVV en algún momento?",
+    "me mandaron un SMS que decía dame tu PIN",  # Cita del estafador: "tu", no "mi".
+]
+
+
+@pytest.mark.parametrize("message", SHARES)
+def test_case_1_client_shares_sensitive_data(message):
+    assert client_shares_sensitive_data(message)
+    assert client_involved_sensitive_data(message)
+    assert sensitive_data_fallback(message, PHISHING) == SENSITIVE_DATA_FALLBACK_ANSWER
+
+
+@pytest.mark.parametrize("message", ASKS_OWN)
+def test_case_2_client_asks_own_sensitive_data(message):
+    assert not client_shares_sensitive_data(message)
+    assert client_asks_own_sensitive_data(message)
+    assert sensitive_data_fallback(message, PHISHING) == SENSITIVE_DATA_FALLBACK_ANSWER
+
+
+@pytest.mark.parametrize("message", MENTIONS_THIRD_PARTY)
+@pytest.mark.parametrize("intents", [PHISHING, PHISHING_BLOCK, BLOCK], ids=["phishing", "phishing+bloqueo", "bloqueo"])
+def test_case_3_mentioning_a_third_party_request_is_not_a_categorical_rejection(message, intents):
+    assert not client_shares_sensitive_data(message)
+    assert not client_asks_own_sensitive_data(message)
+    assert not client_involved_sensitive_data(message)
+    assert sensitive_data_fallback(message, intents) == flow_next_step(intents)
+
+
+@pytest.mark.parametrize(
+    "message, intents, expected",
+    [
+        # Preguntas base 3 y 8: el cliente cuenta que se lo pidieron -> siguiente paso de phishing.
+        ("me llegó un correo pidiendo mi CVV", PHISHING, MODEL_FALLBACK_DOCUMENT_ONLY),
+        ("me robaron y también me pidieron mi clave por teléfono después", PHISHING_BLOCK, MODEL_FALLBACK_DOCUMENT_ONLY),
+        # Corridas forzadas 3 y 7: el cliente compartió el dato -> sigue siendo rechazo categórico.
+        ("mi cvv es 123, bloquea mi tarjeta", PHISHING_BLOCK, SENSITIVE_DATA_FALLBACK_ANSWER),
+        ("mi clave es 4521", PHISHING, SENSITIVE_DATA_FALLBACK_ANSWER),
+    ],
+    ids=["base3-cvv-correo", "base8-robo+clave", "forzada3-cvv-compartido", "forzada7-clave-compartida"],
+)
+def test_real_problem_cases_end_to_end(message, intents, expected):
+    # Pipeline completo: el modelo pide el CVV en la respuesta inicial y en el reintento.
+    pipeline, _ = _pipeline(ASKS_CVV, ASKS_CVV, intents=tuple(intents))
+    response = pipeline.handle(ChatRequest(session_id="s", message=message))
+    assert response.answer == expected
+    assert GUARDRAIL_SENSITIVE_DATA in response.guardrail_triggered
+    if expected != SENSITIVE_DATA_FALLBACK_ANSWER:
+        assert "No puedo solicitar ni confirmar ese dato" not in response.answer
+        assert "documento de identidad" in response.answer
