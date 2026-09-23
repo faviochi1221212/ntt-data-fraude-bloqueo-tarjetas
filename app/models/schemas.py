@@ -1,9 +1,21 @@
 """Schemas Pydantic, incluido el contrato de payload de respuesta del asistente."""
 
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field
+
+
+class Chunk(BaseModel):
+    """Fragmento de la base de conocimiento (app/kb/*.md)."""
+
+    chunk_id: str = Field(..., description="p. ej. 'POL-BLQ-2026-3B'")
+    titulo: str
+    intent: str
+    contenido: str
+    source_policy: str = Field(..., description="Nombre del archivo de política, p. ej. 'POL-BLQ-2026'")
+    version: str = Field(..., description="Versión de la política, derivada del sufijo del nombre de archivo")
+    metadatos: dict[str, Any] = Field(default_factory=dict)
 
 
 class Intent(str, Enum):

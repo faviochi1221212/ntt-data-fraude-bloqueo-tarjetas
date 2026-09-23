@@ -3,6 +3,10 @@ uvicorn[standard]>=0.29
 pydantic>=2.6,<3.0
 pydantic-settings>=2.2,<3.0
 
+# RAG
+fastembed>=0.4
+numpy>=1.26
+
 # LLM
 groq>=0.30
 

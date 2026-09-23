@@ -31,7 +31,11 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 20.0
 
     # Embeddings / RAG
-    embedding_model: str = ""
+    # Modelo de fastembed/ONNX (local, multilingüe; no requiere API key).
+    embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    # Prefijos que exigen algunos modelos (p. ej. e5: "query: " / "passage: ").
+    embedding_query_prefix: str = ""
+    embedding_document_prefix: str = ""
     kb_path: Path = Path("app/kb")
     rag_top_k: int = 4
     rag_min_score: float = 0.0
