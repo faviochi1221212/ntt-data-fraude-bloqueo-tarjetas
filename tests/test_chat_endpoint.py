@@ -61,13 +61,15 @@ class SpyGenerator:
         self.inner, self.answers, self.error = inner, list(answers), error
         self.calls, self.corrections = 0, []
 
-    def generate(self, message, chunks, previous_answer=None, correction=None):
+    def generate(self, message, chunks, intents=frozenset(), previous_answer=None, correction=None):
         self.calls += 1
         self.corrections.append(correction)
         if self.error:
             raise self.error
         if self.inner:
-            return self.inner.generate(message, chunks, previous_answer=previous_answer, correction=correction)
+            return self.inner.generate(
+                message, chunks, intents=intents, previous_answer=previous_answer, correction=correction
+            )
         return self.answers[min(self.calls, len(self.answers)) - 1]
 
 
@@ -100,12 +102,49 @@ def test_system_prompt_keeps_retriever_order_and_aggression_rule():
         _chunk("POL-BLQ-2026-3B", "regla_dura_seguridad", 0.4, 1),
         _chunk("POL-BLQ-2026-2", "excepcion_seguridad", 0.5, 2),
     ]
-    prompt = build_system_prompt(chunks)
+    prompt = build_system_prompt(chunks, frozenset({Intent.BLOQUEAR_TARJETA}))
 
     positions = [prompt.index(c.chunk.chunk_id) for c in chunks]
     assert positions == sorted(positions), "los chunks deben aparecer en el orden recibido"
     assert AGGRESSION_RULE in prompt
     assert AUTH_DATA_RULE in prompt
+
+
+_BLOCK = Intent.BLOQUEAR_TARJETA
+
+
+@pytest.mark.parametrize(
+    "intents",
+    [{_BLOCK}, {_BLOCK, Intent.SOLICITAR_TARJETA_NUEVA}, {_BLOCK, Intent.REPORTAR_FRAUDE}],
+    ids=["bloqueo", "bloqueo+reposicion", "bloqueo+fraude"],
+)
+def test_system_prompt_includes_aggression_rule_where_phone_key_is_allowed(intents):
+    assert AGGRESSION_RULE in build_system_prompt([], frozenset(intents))
+
+
+@pytest.mark.parametrize(
+    "intents",
+    [
+        {Intent.REPORTAR_FRAUDE},
+        {Intent.SOLICITAR_TARJETA_NUEVA},
+        {Intent.DESBLOQUEAR_TARJETA},
+        {Intent.REPORTAR_INTENTO_PHISHING},
+        {Intent.REPORTAR_INTENTO_PHISHING, _BLOCK},
+    ],
+    ids=["fraude", "reposicion", "desbloqueo", "phishing", "phishing+bloqueo"],
+)
+def test_system_prompt_omits_aggression_rule_elsewhere(intents):
+    prompt = build_system_prompt([], frozenset(intents))
+    assert AGGRESSION_RULE not in prompt
+    assert "sigue exigiendo documento de identidad y clave telefónica" not in prompt
+    assert AUTH_DATA_RULE in prompt  # El resto de las reglas sigue presente.
+
+
+def test_system_prompt_rules_are_numbered_consecutively():
+    for intents in [frozenset({_BLOCK}), frozenset({Intent.REPORTAR_FRAUDE})]:
+        prompt = build_system_prompt([], intents)
+        rules = re.findall(r"^(\d+)\. ", prompt, re.MULTILINE)
+        assert rules == [str(n) for n in range(1, len(rules) + 1)], intents
 
 
 def test_out_of_scope_skips_retriever_and_generator():
@@ -168,15 +207,16 @@ def test_auth_channel_guardrail_falls_back_to_fixed_text_after_failed_retry():
     assert response.guardrail_triggered == [GUARDRAIL_AUTH_CHANNEL]
 
 
-def test_auth_channel_guardrail_does_not_apply_to_phishing():
-    # El texto fijo pide clave telefónica, lo que contradice POL-SEG-2026-2 en phishing.
-    leaky_phishing = "Si te llegó un correo pidiendo datos, no respondas."
+def test_auth_channel_guardrail_allows_phishing_education():
+    # El guardrail de canal corre en todos los intents, pero describir el ataque ("si te llegó
+    # un correo pidiendo datos") es legítimo: no hay un dato de autenticación antes del canal.
+    education = "Si te llegó un correo pidiendo datos, no respondas."
     pipeline, generator = _block_pipeline(
-        leaky_phishing, intents=(Intent.REPORTAR_INTENTO_PHISHING, Intent.BLOQUEAR_TARJETA)
+        education, intents=(Intent.REPORTAR_INTENTO_PHISHING, Intent.BLOQUEAR_TARJETA)
     )
     response = pipeline.handle(ChatRequest(session_id="s", message="me pidieron mi clave"))
     assert generator.calls == 1
-    assert response.answer == leaky_phishing
+    assert response.answer == education
     assert response.guardrail_triggered == []
 
 

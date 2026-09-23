@@ -14,13 +14,7 @@ from app.models.schemas import (
     Intent,
     ResponseSource,
 )
-from app.guardrails.response_validators import (
-    AUTH_CHANNEL_FALLBACK_ANSWER,
-    AUTH_CHANNEL_RETRY_INSTRUCTION,
-    GUARDRAIL_AUTH_CHANNEL,
-    auth_channel_stats,
-    describes_auth_channel,
-)
+from app.guardrails.response_validators import RESPONSE_GUARDRAILS_BY_SEVERITY
 from app.orchestrator.classifier import LLMClassifier, classify
 from app.orchestrator.generator import GenerationError
 from app.rag.retriever import RetrievedChunk
@@ -71,6 +65,7 @@ class Generator(Protocol):
         self,
         message: str,
         chunks: list[RetrievedChunk],
+        intents: frozenset = frozenset(),
         previous_answer: Optional[str] = None,
         correction: Optional[str] = None,
     ) -> str: ...
@@ -107,14 +102,13 @@ class ChatPipeline:
             logger.error("Sin chunks para intents %s", [i.intent.value for i in real_intents])
             return self._static(request, FALLBACK_ANSWER, requires_human=True)
 
+        intent_set = frozenset(i.intent for i in real_intents)
         try:
-            answer = self._generator.generate(request.message, chunks)
+            answer = self._generator.generate(request.message, chunks, intents=intent_set)
         except GenerationError:
             return self._static(request, FALLBACK_ANSWER, requires_human=True)
 
-        guardrails: list[str] = []
-        if self._auth_channel_guardrail_applies(real_intents):
-            answer = self._enforce_no_auth_channel(request.message, chunks, answer, guardrails)
+        answer, guardrails = self._apply_guardrails(request.message, chunks, answer, intent_set)
 
         return ChatResponse(
             session_id=request.session_id,
@@ -129,38 +123,68 @@ class ChatPipeline:
             requires_human=requires_human(real_intents, request.message),
         )
 
-    @staticmethod
-    def _auth_channel_guardrail_applies(intents: list[ClassifiedIntent]) -> bool:
-        # Solo en el flujo de bloqueo: su texto fijo pide documento + clave telefónica, que es lo
-        # correcto para el bloqueo estándar pero NO para phishing (solo documento, POL-SEG-2026-2)
-        # ni desbloqueo (no se capturan datos, POL-BLQ-2026-5). En phishing, además, frases como
-        # "si te llegó un correo" son legítimas y el patrón las marcaría.
-        return {i.intent for i in intents} == {Intent.BLOQUEAR_TARJETA}
+    def _apply_guardrails(
+        self, message: str, chunks: list[RetrievedChunk], answer: str, intents: frozenset
+    ) -> tuple[str, list[str]]:
+        """Respaldo estructural de las reglas del prompt. Retorna (answer, guardrail_triggered).
 
-    def _enforce_no_auth_channel(
-        self, message: str, chunks: list[RetrievedChunk], answer: str, guardrails: list[str]
-    ) -> str:
-        """Respaldo estructural de AUTH_DATA_RULE: un reintento y, si falla, texto fijo."""
-        auth_channel_stats.record_check()
-        if not describes_auth_channel(answer):
-            return answer
+        Orden de ejecución de las defensas:
+        1. hard_triggers (entrada, en el classifier): intents de seguridad que no dependen del LLM.
+        2. auth_channel_disclosure (salida, todos los intents).
+        3. phone_key_outside_block (salida, donde el flujo no admite la clave telefónica:
+           not allows_phone_key(intents), es decir sin bloqueo o con phishing).
+        4. sensitive_data_request (salida, todos los intents): corre al final, como última
+           barrera antes de responder.
 
-        auth_channel_stats.record_retry()
-        try:
-            retried = self._generator.generate(
-                message, chunks, previous_answer=answer, correction=AUTH_CHANNEL_RETRY_INSTRUCTION
+        Jerarquía de severidad (RESPONSE_GUARDRAILS_BY_SEVERITY), de mayor a menor:
+        datos sensibles (CVV/PAN/clave completa) > clave telefónica fuera de bloqueo >
+        canal de autenticación > el resto. La ejecución va en orden inverso para que el más
+        severo sea la última barrera.
+
+        Revalidación cruzada: cada guardrail que detecta un problema pide UN reintento, y la
+        respuesta regenerada se valida contra TODOS los guardrails que aplican a esos intents,
+        no solo contra el que la originó (un reintento puede corregir un problema e introducir
+        otro). Si la regenerada viola cualquiera, se usa el texto fijo del guardrail más severo
+        entre los involucrados (el que originó el reintento y los que violó la regenerada), y
+        todos ellos se reportan en guardrail_triggered. El texto fijo depende de los intents y
+        de si el dato sensible lo introdujo el cliente o el modelo (ver response_validators).
+        """
+        applicable = [g for g in RESPONSE_GUARDRAILS_BY_SEVERITY if g.applies(intents)]
+
+        for guardrail in reversed(applicable):  # Ejecución: el más severo al final.
+            guardrail.stats.record_check()
+            if not guardrail.detect(answer, message, intents):
+                continue
+
+            guardrail.stats.record_retry()
+            try:
+                retried = self._generator.generate(
+                    message,
+                    chunks,
+                    intents=intents,
+                    previous_answer=answer,
+                    correction=guardrail.retry_instruction(intents),
+                )
+            except GenerationError:
+                retried = None
+
+            if retried is None:
+                violated = []  # Sin reintento (error de API): solo el guardrail que lo pidió.
+            else:
+                violated = [g for g in applicable if g.detect(retried, message, intents)]
+                if not violated:
+                    answer = retried
+                    continue
+
+            involved = [g for g in applicable if g is guardrail or g in violated]  # Por severidad.
+            most_severe = involved[0]
+            guardrail.stats.record_fallback(
+                "el reintento falló" if retried is None
+                else f"el reintento viola {', '.join(g.name for g in violated)}; texto fijo de {most_severe.name}"
             )
-        except GenerationError:
-            retried = None
+            return most_severe.fallback(message, intents), [g.name for g in involved]
 
-        if retried is not None and not describes_auth_channel(retried):
-            return retried
-
-        auth_channel_stats.record_fallback(
-            "el reintento falló" if retried is None else "el reintento también describe el canal"
-        )
-        guardrails.append(GUARDRAIL_AUTH_CHANNEL)
-        return AUTH_CHANNEL_FALLBACK_ANSWER
+        return answer, []
 
     @staticmethod
     def _static(request: ChatRequest, answer: str, requires_human: bool) -> ChatResponse:
