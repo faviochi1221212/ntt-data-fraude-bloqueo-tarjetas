@@ -53,6 +53,7 @@ class ResponseSource(str, Enum):
     KB = "kb"  # Base de conocimiento (RAG)
     API = "api"  # API simulada (p. ej. bloqueo de tarjeta)
     GUARDRAIL = "guardrail"  # Respuesta bloqueada/forzada por una validación dura
+    STATIC = "static"  # Mensaje predefinido (fuera de alcance o fallback), sin RAG ni LLM
 
 
 class ChatRequest(BaseModel):

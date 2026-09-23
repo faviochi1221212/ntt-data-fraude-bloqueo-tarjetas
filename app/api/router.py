@@ -2,6 +2,7 @@
 
 from fastapi import APIRouter
 
-api_router = APIRouter(prefix="/api/v1")
+from app.api import chat
 
-# TODO: registrar routers, p. ej. api_router.include_router(chat.router)
+api_router = APIRouter(prefix="/api/v1")
+api_router.include_router(chat.router)
