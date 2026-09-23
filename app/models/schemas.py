@@ -6,6 +6,35 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 
+class Intent(str, Enum):
+    BLOQUEAR_TARJETA = "bloquear_tarjeta"
+    DESBLOQUEAR_TARJETA = "desbloquear_tarjeta"
+    REPORTAR_FRAUDE = "reportar_fraude"
+    SOLICITAR_TARJETA_NUEVA = "solicitar_tarjeta_nueva"
+    REPORTAR_INTENTO_PHISHING = "reportar_intento_phishing"
+    FUERA_DE_ALCANCE = "fuera_de_alcance"
+
+
+class IntentOrigin(str, Enum):
+    HARD_TRIGGER = "hard_trigger"
+    GROQ = "groq"
+
+
+class ClassifiedIntent(BaseModel):
+    intent: Intent
+    origin: IntentOrigin
+    # Confianza reportada por Groq; None si el intent vino solo de hard_trigger.
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
+
+class ClassificationResult(BaseModel):
+    intents: list[ClassifiedIntent] = Field(default_factory=list)
+    # Motivo por el que la capa Groq no aportó resultados (sin key, error de API, JSON inválido).
+    llm_error: Optional[str] = None
+    # Problemas parciales en la respuesta de Groq (p. ej. un intent inválido descartado).
+    llm_warnings: list[str] = Field(default_factory=list)
+
+
 class ResponseSource(str, Enum):
     """Origen de la respuesta que decide el orquestador."""
 

@@ -24,11 +24,11 @@ class Settings(BaseSettings):
     app_env: Literal["local", "dev", "staging", "prod"] = "local"
     log_level: str = "INFO"
 
-    # Proveedor LLM
-    llm_provider: Literal["openai", "anthropic"] = "openai"
-    llm_model: str = ""
-    openai_api_key: Optional[SecretStr] = None
-    anthropic_api_key: Optional[SecretStr] = None
+    # LLM (Groq)
+    groq_api_key: Optional[SecretStr] = None
+    # Debe soportar structured outputs estrictos (json_schema strict) en Groq.
+    groq_model: str = "openai/gpt-oss-120b"
+    llm_timeout_seconds: float = 20.0
 
     # Embeddings / RAG
     embedding_model: str = ""
