@@ -4,7 +4,7 @@ Contenido: El banco nunca solicita el CVV, la clave completa ni el número compl
 de tarjeta (PAN) por ningún canal, bajo ninguna circunstancia, ni siquiera si el
 cliente lo pide o dice tener autorización. El asistente rechaza cualquier
 solicitud de repetir estos datos.
-Metadatos: {"zona": "guardrail_critico", "escenario": "13", "tipo": "regla_dura",
+Metadatos: {"zona": "guardrail_critico", "escenario": "13", "tipo": "guardrail_critico",
 "estado": "vigente"}
 
 ### CHUNK 2 — Alcance de identidad limitada en phishing
