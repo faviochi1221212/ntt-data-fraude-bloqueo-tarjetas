@@ -5,8 +5,8 @@ import "./globals.css";
 const inter = Inter({ variable: "--font-inter", subsets: ["latin"], display: "swap" });
 
 export const metadata: Metadata = {
-  title: "Asistente de seguridad",
-  description: "Asistente para bloqueo de tarjetas, reportes de fraude y seguridad de tu cuenta.",
+  title: "Centinela",
+  description: "Centinela — asistente de bloqueo de tarjetas, reportes de fraude y seguridad de tu cuenta.",
 };
 
 export const viewport: Viewport = {

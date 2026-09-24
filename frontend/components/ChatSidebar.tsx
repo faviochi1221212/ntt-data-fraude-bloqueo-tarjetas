@@ -29,7 +29,7 @@ export default function ChatSidebar({
           <ShieldIcon className="size-5" />
         </span>
         <div className="min-w-0 flex-1">
-          <p className="truncate text-sm font-semibold text-ink">Asistente de seguridad</p>
+          <p className="truncate text-sm font-semibold text-ink">Centinela</p>
           <p className="truncate text-xs text-ink-3">Tarjetas, fraude y protección</p>
         </div>
         {headerAction}

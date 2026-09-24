@@ -1,4 +1,4 @@
-# Frontend: Asistente de seguridad
+# Frontend — Centinela
 
 Interfaz de chat en Next.js 16 (App Router) + Tailwind CSS v4 para el backend FastAPI de este
 repositorio.

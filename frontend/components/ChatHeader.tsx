@@ -22,7 +22,7 @@ export default function ChatHeader({ onOpenMenu, onEndSession, canEndSession, me
       </button>
 
       <div className="min-w-0 flex-1">
-        <h1 className="truncate text-[15px] font-semibold text-ink">Asistente de seguridad</h1>
+        <h1 className="truncate text-[15px] font-semibold text-ink">Centinela</h1>
         <p className="flex items-center gap-1.5 text-xs text-ink-3">
           <span className="size-1.5 shrink-0 rounded-full bg-success-ink" aria-hidden="true" />
           <span className="truncate">
