@@ -136,6 +136,26 @@ víctima. Corregido pasando el mensaje del cliente como contexto explícito (mar
 no como instrucción) y agregando esos dos casos como ejemplos few-shot de qué NO marcar.
 Revalidado: ambos casos pasan y la inversión se sigue marcando.
 
+Falso positivo similar, corregido: idempotencia aplicada a una primera solicitud de bloqueo.
+En la integración contra Groq con BLOCK_PENDING (`test_live_block_pending_says_in_process`),
+el verificador marcó "iniciaré el proceso de bloqueo" invocando POL-BLQ-2026-4 ("una segunda
+solicitud no genera una nueva operación"), aunque era la primera solicitud. Solo recibía el
+estado (`BLOCK_PENDING`), no si la operación era nueva o repetida. El reintento quedó en
+"¿Hay algo más en lo que pueda ayudarte?", que pasó todos los guardrails (no afirma nada) y se
+entregó: el cliente no supo que su bloqueo estaba en proceso. Dos correcciones:
+
+- Hecho del sistema explícito para el verificador (`block_operation_fact`): "operación nueva,
+  no una solicitud repetida; la idempotencia no aplica", o "solicitud repetida" con
+  ALREADY_BLOCKED.
+- Red de seguridad en el pipeline (`reports_operation_state`): si en el turno hubo una
+  operación (bloqueo, o transacción pending) y un reintento aceptado ya no la menciona, se usa
+  el texto fijo del estado y se agrega `state_dropped_after_retry` a `guardrail_triggered`.
+  Es un chequeo de presencia ("bloque…", "pendiente/preliminar/liquid…"), no de corrección, y
+  solo aplica tras un reintento: una primera respuesta que omita el estado no se intercepta.
+
+Revalidado: 3 de 3 corridas del test pasan, sin reintentos (la red de seguridad no se activó en
+vivo; está cubierta por tests offline).
+
 Límite que permanece: no cubre la "verificación de línea delegada al propio cliente"
 (sección anterior). Cuando el modelo le pide al cliente "confirme que está comunicándose
 desde su número de línea registrado", el verificador lo aprueba, porque la frase parafrasea
@@ -170,7 +190,43 @@ corridas 4#1 y 4#2, también reintentos tras una primera respuesta forzada), el 
 respondió "Vamos a registrar tu reporte … Generaremos un número de caso en las próximas 24
 horas" y "Registraremos su reporte de forma inmediata y le asignaremos un número de caso". No
 afirma que la acción ya ocurrió, pero promete acciones futuras que el sistema actual no
-ejecuta: no hay integración real de backend y `action` sigue siendo `null` en `ChatResponse`.
+ejecuta: el registro del reporte y la asignación de un número de caso no existen, ni siquiera
+en el backend simulado (que solo cubre el bloqueo y el estado de la transacción; ver
+"Backend transaccional simulado"). Se volvió a observar en la prueba de transacción pending
+contra Groq: "En los próximos días recibirás la confirmación de que el reporte ha sido
+recibido", una promesa que el verificador de fidelidad no marcó.
+
+Por qué el verificador no la marcó (investigado reconstruyendo el caso contra Groq: mismo
+mensaje, mismos chunks de `reportar_fraude`, mismo hecho del sistema `pending`; ver abajo el
+alcance de la evidencia):
+
+- Sí vio el texto. En el pipeline, el verificador corre sobre toda respuesta generada cuando
+  hay chunks, y si falla la respuesta se bloquea (`faithfulness_unverified`). Como la
+  respuesta se entregó tal cual y sin esa marca, el verificador la evaluó y la aprobó.
+- La causa no es la lista de exclusiones ("NO cuentes como…": advertencias, derivación a
+  asesor, cortesía). En modo diagnóstico, que obliga a clasificar cada oración y a nombrar la
+  exclusión aplicada, la promesa nunca se clasificó como excluida y quedó `sin_respaldo` en 4
+  de 4 corridas. Esa lista le quita algo de sensibilidad al veredicto binario (con la lista
+  la promesa se marcó en 1 de 7 corridas; sin la lista, en 4 de 7), pero aun sin ella se
+  aprueba en casi la mitad de los casos.
+- Causa 1: la promesa parafrasea un chunk. POL-FRD-2026-1 dice que el registro "constituye
+  únicamente la confirmación de recepción del reclamo", así que "recibirás la confirmación de
+  que el reporte ha sido recibido" no es un dato inventado sino un eco de ese chunk. Lo que
+  no tiene respaldo es otra cosa: (a) el plazo ("próximos días" frente a "de forma inmediata,
+  dentro de las primeras 24 horas"), (b) aplicarlo a una transacción pending, donde
+  POL-FRD-2026-4 solo dice que el reporte queda como preliminar, y (c) que el sistema vaya a
+  enviar algo, cuando ningún componente del MVP envía confirmaciones. El verificador contrasta
+  el texto contra los fragmentos y los hechos del sistema, pero no contra lo que el sistema
+  puede ejecutar. Por eso (c) no puede detectarlo, y (a) y (b) los aprueba como paráfrasis
+  fiel. Es el mismo punto ciego que la "verificación de línea delegada al propio cliente".
+- Causa 2: el veredicto binario sin descomposición es inestable. Con `temperature=0` y la
+  misma entrada, el prompt actual aprobó la promesa en 6 de 7 corridas. Cuando se le pide
+  clasificar oración por oración, la marca en todas.
+
+Alcance de la evidencia: de la respuesta original solo quedó registrada esta frase, así que
+se usó una respuesta reconstruida alrededor de ella (con y sin frases de cortesía). Las
+muestras son chicas (n=7 por variante con cortesía, n=2 sin ella) y sirven para descartar
+hipótesis, no para estimar tasas.
 
 Por qué es un riesgo: el cliente puede quedar esperando un número de caso que nunca llega y
 no reportar por otro canal. La regla del prompt que prohíbe afirmar operaciones ejecutadas
@@ -178,12 +234,18 @@ no reportar por otro canal. La regla del prompt que prohíbe afirmar operaciones
 una acción futura que tampoco se va a cumplir en este MVP.
 
 Mitigación activa: parcial. `_NO_ACTIONS_RULE` reduce el caso más grave (afirmar un éxito ya
-ocurrido), pero no impide prometer algo pendiente. Ningún guardrail de código lo detecta.
+ocurrido), pero no impide prometer algo pendiente. Ningún guardrail de código lo detecta, y
+el verificador de fidelidad tampoco es una red confiable para este caso (ver causas arriba).
 
 Trabajo futuro: reforzar `_NO_ACTIONS_RULE` para prohibir explícitamente promesas de acciones
-futuras cuando no exista una integración real que las respalde, o conectarlo con el mock de
-API (Prompt 7) para que el asistente solo prometa lo que corresponda a un estado real devuelto
-por el backend simulado.
+futuras cuando no exista una integración (real o simulada) que las respalde. El bloqueo ya está
+conectado al backend simulado (el asistente refleja el estado devuelto); el registro de casos
+de fraude todavía no. Del lado del verificador: (1) pasar como hecho del sistema lo que el MVP
+no ejecuta (p. ej. "este canal no registra casos ni envía confirmaciones") para que una promesa
+de seguimiento contradiga un hecho explícito, y (2) evaluar si pedir clasificación por oración
+antes del veredicto (el modo diagnóstico de esta investigación) mejora la sensibilidad sin
+aumentar los falsos positivos ya corregidos. Tiene un costo en tokens, relevante con el
+límite de Groq.
 
 ## Retriever: bloqueo estándar recuperado en phishing + bloqueo
 
@@ -210,3 +272,56 @@ utilidad: el cliente recibe un texto fijo en lugar de una respuesta sobre su cas
 Trabajo futuro: excluir POL-BLQ-2026-1 (y cualquier chunk de autenticación estándar) de los
 resultados de `search_by_intent()` cuando phishing esté entre los intents detectados, ya que
 POL-SEG-2026-2 debe prevalecer sobre el procedimiento estándar de bloqueo en ese escenario.
+
+## Alcance: backend transaccional simulado (mock)
+
+Estado actual: el bloqueo de tarjeta y la consulta del estado de una transacción no están
+integrados con el backend del banco. Ambos son simulados en `app/api/mock_backend.py`:
+
+- `simulate_block_request`: BLOCKED 70 %, BLOCK_PENDING 10 %, BLOCK_FAILED 10 %,
+  ALREADY_BLOCKED 10 %. BLOCK_REQUESTED tiene peso 0 (solo aparece forzándolo).
+- `simulate_transaction_status`: settled 80 %, pending 20 %.
+- Los identificadores de tarjeta y de transacción no existen: se usan `card-<session_id>` y
+  `txn-<session_id>`.
+
+Es un límite de alcance conocido del MVP, no un error: `action` en `ChatResponse` refleja el
+estado devuelto por el mock (ya no es siempre `null`), y el asistente, los guardrails y el
+verificador de fidelidad trabajan contra ese estado como si fuera real.
+
+Flujo de bloqueo en dos turnos (POL-BLQ-2026-1/2/3B): el primer turno pide los datos de
+identidad y no ejecuta nada; el bloqueo simulado se ejecuta en el siguiente turno de la misma
+sesión, si la respuesta anterior del asistente quedó marcada en el historial como pedido de
+datos para bloquear y el mensaje del cliente trae un número de documento (6+ dígitos). Los
+datos de identidad NO se validan: cualquier número de documento y cualquier clave avanzan el
+flujo. La única señal que se lee del texto actual es la presencia de ese número.
+
+Límites asociados:
+
+- Si el cliente responde sin un número de documento, el asistente vuelve a pedir los datos.
+- Transacción en hold (POL-FRD-2026-4): la política dice que se informa el plazo estimado de
+  liquidación, pero no indica cuánto es. El prompt le prohíbe al modelo dar una cifra; en la
+  prueba contra Groq no mencionó el plazo en absoluto, y en cambio mencionó el plazo de 30 días
+  del dictamen (POL-FRD-2026-1), que corresponde al caso formal y no al reporte preliminar.
+- Cada consulta de fraude simula una transacción nueva: no hay forma de referirse a una
+  transacción concreta.
+
+## Persistencia: historial de conversaciones en SQLite
+
+Estado actual: `/api/v1/chat` guarda cada turno en SQLite (`DATABASE_PATH`, por defecto
+`data/chat.db`, fuera de git) y recupera el historial de la sesión antes de procesar; los
+últimos `HISTORY_CONTEXT_MESSAGES` mensajes se pasan como contexto al classifier y al
+generador. `GET /api/v1/chats` y `GET /api/v1/chats/{session_id}` exponen las sesiones para el
+frontend.
+
+Límites:
+
+- El mensaje del cliente se guarda enmascarado (`mask_sensitive_data`): claves, CVV, PIN y
+  códigos junto a su palabra clave, números de tarjeta y números de 6+ dígitos (documentos)
+  quedan como `[dato omitido]`. Es una heurística de patrones: un dato sensible escrito de otra
+  forma (p. ej. dígitos separados por espacios fuera de un PAN) podría persistirse.
+- El mensaje actual sí se envía completo a Groq (classifier, generador y verificador), como
+  antes de esta versión; solo el historial va enmascarado.
+- No hay autenticación ni aislamiento por usuario: cualquiera que conozca un `session_id`
+  puede leer esa sesión, y `GET /api/v1/chats` lista todas. Aceptable para el MVP local, no
+  para un despliegue real.
+- SQLite local, sin migraciones ni política de retención.
