@@ -228,6 +228,24 @@ se usó una respuesta reconstruida alrededor de ella (con y sin frases de cortes
 muestras son chicas (n=7 por variante con cortesía, n=2 sin ella) y sirven para descartar
 hipótesis, no para estimar tasas.
 
+Cuarta aparición, con BLOCK_FAILED (suite de integración, `test_live_block_failed_does_not_say_blocked`,
+que pasó porque solo verifica que no se afirme el bloqueo): "Un asesor se pondrá en contacto
+con usted a la brevedad para completar el proceso". Este caso muestra que el patrón tiene
+dos subtipos que no conviene tratar como el mismo error:
+
+- Promesa sin ningún respaldo estructural. Ejemplos: la confirmación "en los próximos días"
+  con la transacción pending, o el número de caso de fraude. Ningún componente del sistema
+  (backend simulado, pipeline, estado de la sesión) hace eso: la promesa entera es falsa.
+- Promesa con respaldo parcial y un detalle no verificado. El caso de BLOCK_FAILED: el hecho
+  central tiene soporte, porque el pipeline marca `requires_human=True` cuando el bloqueo
+  falla y el texto fijo de ese estado ya dice "Un asesor dará seguimiento a tu caso". El
+  matiz no lo tiene: "a la brevedad" no aparece en ningún chunk (la KB no menciona asesores
+  ni plazos de contacto) ni en el estado del sistema. Una salvedad sobre el "hecho central":
+  `requires_human` es solo una marca en la respuesta y el MVP no ejecuta ninguna derivación.
+  Que un asesor efectivamente contacte al cliente depende de que el consumidor de la API
+  actúe sobre esa marca, así que "se pondrá en contacto" (contacto saliente) también afirma
+  algo más que lo que la marca garantiza.
+
 Por qué es un riesgo: el cliente puede quedar esperando un número de caso que nunca llega y
 no reportar por otro canal. La regla del prompt que prohíbe afirmar operaciones ejecutadas
 (`_NO_ACTIONS_RULE` en `app/orchestrator/generator.py`) no cubre explícitamente la promesa de
@@ -242,7 +260,14 @@ futuras cuando no exista una integración (real o simulada) que las respalde. El
 conectado al backend simulado (el asistente refleja el estado devuelto); el registro de casos
 de fraude todavía no. Del lado del verificador: (1) pasar como hecho del sistema lo que el MVP
 no ejecuta (p. ej. "este canal no registra casos ni envía confirmaciones") para que una promesa
-de seguimiento contradiga un hecho explícito, y (2) evaluar si pedir clasificación por oración
+de seguimiento contradiga un hecho explícito. Esos hechos deberían distinguir los dos subtipos
+de arriba en vez de negar todo seguimiento: "no se registran casos ni se envían
+confirmaciones" (subtipo sin respaldo, la promesa se marca entera) frente a "el turno quedó
+marcado para derivación a un asesor, sin plazo de contacto definido" (subtipo con respaldo
+parcial: la derivación está respaldada y solo se marca el detalle agregado, como el plazo).
+Un hecho único del tipo "este canal no hace seguimiento" marcaría como falsa la derivación de
+BLOCK_FAILED, que sí tiene soporte, y tendría el mismo efecto que el falso positivo de
+idempotencia. (2) Evaluar si pedir clasificación por oración
 antes del veredicto (el modo diagnóstico de esta investigación) mejora la sensibilidad sin
 aumentar los falsos positivos ya corregidos. Tiene un costo en tokens, relevante con el
 límite de Groq.
