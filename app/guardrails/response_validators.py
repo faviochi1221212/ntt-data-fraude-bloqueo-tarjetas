@@ -222,6 +222,23 @@ def extract_shared_secrets(user_message: str) -> SharedSecrets:
     return SharedSecrets(strict=frozenset(strict), bare=frozenset(bare))
 
 
+MASKED_DATA = "[dato omitido]"
+# Números de documento u otros identificadores largos (6+ dígitos seguidos).
+_LONG_NUMBER = re.compile(r"(?<!\d)\d{6,}(?!\d)")
+
+
+def mask_sensitive_data(text: str) -> str:
+    """Enmascara lo que no debe persistirse ni reenviarse como historial: claves, CVV, PIN y
+    códigos que el cliente escribió junto a su palabra clave, números de tarjeta y números
+    largos (documentos). Montos y plazos cortos ("300 soles", "24 horas") se conservan.
+    """
+    masked = _PAN_LIKE.sub(MASKED_DATA, text)
+    masked = _LONG_NUMBER.sub(MASKED_DATA, masked)
+    for secret in sorted(extract_shared_secrets(text).all, key=len, reverse=True):
+        masked = re.sub(rf"(?<!\d){re.escape(secret)}(?!\d)", MASKED_DATA, masked)
+    return masked
+
+
 def client_shares_sensitive_data(user_message: str) -> bool:
     """Caso 1: el cliente escribió un dato sensible ("mi clave es 4521", "mi CVV es 123")."""
     return bool(extract_shared_secrets(user_message).all)

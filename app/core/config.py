@@ -43,6 +43,11 @@ class Settings(BaseSettings):
     # API simulada (bloqueo de tarjetas)
     mock_api_base_url: str = "http://localhost:8001"
 
+    # Persistencia de conversaciones (SQLite)
+    database_path: Path = Path("data/chat.db")
+    # Mensajes anteriores de la sesión que se pasan como contexto al classifier y al generador.
+    history_context_messages: int = 6
+
 
 @lru_cache
 def get_settings() -> Settings:

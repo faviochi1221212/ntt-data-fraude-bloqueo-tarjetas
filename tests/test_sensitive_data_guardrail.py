@@ -36,7 +36,7 @@ from app.guardrails.response_validators import (
 )
 from app.models.schemas import ChatRequest, Intent
 from app.orchestrator.pipeline import ChatPipeline
-from tests.test_chat_endpoint import SpyGenerator, SpyRetriever, _chunk, _fixed_classify
+from tests.test_chat_endpoint import SpyGenerator, SpyRetriever, _chunk, _fixed_classify, offline_pipeline
 
 SHARED_KEY_MESSAGE = "mi clave es 4521, ayúdame a bloquear mi tarjeta"
 
@@ -231,7 +231,7 @@ ASKS_PHONE_KEY = "Para registrar tu reporte, indícame tu documento de identidad
 def _pipeline(*answers, intents=(Intent.BLOQUEAR_TARJETA,)):
     retriever = SpyRetriever(result=[_chunk("POL-SEG-2026-1", "guardrail_critico", 0.2, 0)])
     generator = SpyGenerator(answers=answers)
-    return ChatPipeline(retriever, generator, classify_fn=_fixed_classify(*intents)), generator
+    return offline_pipeline(retriever, generator, classify_fn=_fixed_classify(*intents)), generator
 
 
 def test_clean_answer_passes_without_retry():
@@ -377,7 +377,7 @@ def test_failed_retry_reports_only_the_guardrail_that_requested_it():
     from app.orchestrator.generator import GenerationError
 
     class FirstOkThenError(SpyGenerator):
-        def generate(self, message, chunks, intents=frozenset(), previous_answer=None, correction=None):
+        def generate(self, message, chunks, intents=frozenset(), previous_answer=None, correction=None, context=None):
             if correction is not None:
                 self.calls += 1
                 raise GenerationError("429")
@@ -385,7 +385,7 @@ def test_failed_retry_reports_only_the_guardrail_that_requested_it():
 
     retriever = SpyRetriever(result=[_chunk("POL-SEG-2026-1", "guardrail_critico", 0.2, 0)])
     generator = FirstOkThenError(answers=[ASKS_CVV])
-    pipeline = ChatPipeline(retriever, generator, classify_fn=_fixed_classify(Intent.REPORTAR_INTENTO_PHISHING))
+    pipeline = offline_pipeline(retriever, generator, classify_fn=_fixed_classify(Intent.REPORTAR_INTENTO_PHISHING))
     response = pipeline.handle(ChatRequest(session_id="s", message="me llegó un correo raro"))
     assert response.answer == MODEL_FALLBACK_DOCUMENT_ONLY
     assert response.guardrail_triggered == [GUARDRAIL_SENSITIVE_DATA]

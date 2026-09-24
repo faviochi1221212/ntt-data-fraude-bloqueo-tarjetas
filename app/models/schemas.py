@@ -1,7 +1,7 @@
 """Schemas Pydantic, incluido el contrato de payload de respuesta del asistente."""
 
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -30,6 +30,8 @@ class Intent(str, Enum):
 class IntentOrigin(str, Enum):
     HARD_TRIGGER = "hard_trigger"
     GROQ = "groq"
+    # Intent retomado del flujo guardado en la sesión (p. ej. el turno que ejecuta el bloqueo).
+    SESSION = "session"
 
 
 class ClassifiedIntent(BaseModel):
@@ -70,6 +72,8 @@ class Citation(BaseModel):
 class ActionResult(BaseModel):
     name: str = Field(..., description="Acción ejecutada, p. ej. 'block_card'")
     success: bool
+    # Estado devuelto por el backend (simulado en el MVP): p. ej. BLOCKED, BLOCK_PENDING, pending.
+    status: Optional[str] = None
     reference_id: Optional[str] = None
     detail: Optional[str] = None
 
@@ -87,3 +91,25 @@ class ChatResponse(BaseModel):
         description="Guardrails activados; lista vacía si no se activó ninguno",
     )
     requires_human: bool = False
+
+
+class StoredMessage(BaseModel):
+    """Mensaje guardado en el historial de una sesión."""
+
+    role: Literal["user", "assistant"]
+    content: str
+    timestamp: str
+    # Metadatos del turno (en los mensajes del asistente: intents, guardrail_triggered, action,
+    # citations, source, requires_human y el estado del flujo de bloqueo).
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ChatSessionSummary(BaseModel):
+    session_id: str
+    summary: str = Field(..., description="Primer mensaje del usuario, truncado")
+    last_message_at: str
+
+
+class ChatSessionDetail(BaseModel):
+    session_id: str
+    messages: list[StoredMessage]

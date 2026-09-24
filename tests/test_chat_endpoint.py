@@ -9,11 +9,13 @@
 import re
 import time
 import unicodedata
+from typing import Optional
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api.chat import get_pipeline
+from app.api.chat import get_chat_store, get_pipeline
+from app.api.mock_backend import BlockStatus, TransactionStatus
 from app.core.config import get_settings
 from app.main import app
 from app.models.schemas import (
@@ -39,9 +41,16 @@ from app.guardrails.response_validators import (
     GUARDRAIL_PHONE_KEY_OUTSIDE_BLOCK,
     GUARDRAIL_SENSITIVE_DATA,
 )
+from app.guardrails.action_validators import (
+    GUARDRAIL_BLOCK_STATUS_MISMATCH,
+    GUARDRAIL_FORMAL_CASE_WHILE_PENDING,
+    GUARDRAIL_STATE_DROPPED_AFTER_RETRY,
+    TRANSACTION_PENDING_HOLD,
+)
 from app.guardrails.faithfulness import FAITHFULNESS_UNVERIFIED, GUARDRAIL_UNSUPPORTED_CLAIM
 from app.orchestrator.pipeline import FALLBACK_ANSWER, OUT_OF_SCOPE_ANSWER, ChatPipeline
 from app.rag.retriever import RetrievedChunk
+from app.storage.chat_store import ChatStore
 from tests.test_classifier_manual import QUESTIONS
 
 
@@ -66,14 +75,14 @@ class SpyGenerator:
         self.inner, self.answers, self.error = inner, list(answers), error
         self.calls, self.corrections = 0, []
 
-    def generate(self, message, chunks, intents=frozenset(), previous_answer=None, correction=None):
+    def generate(self, message, chunks, intents=frozenset(), previous_answer=None, correction=None, context=None):
         self.calls += 1
         self.corrections.append(correction)
         if self.error:
             raise self.error
         if self.inner:
             return self.inner.generate(
-                message, chunks, intents=intents, previous_answer=previous_answer, correction=correction
+                message, chunks, intents=intents, previous_answer=previous_answer, correction=correction, context=context
             )
         return self.answers[min(self.calls, len(self.answers)) - 1]
 
@@ -95,7 +104,14 @@ def _fixed_classify(*intents: Intent):
     result = ClassificationResult(
         intents=[ClassifiedIntent(intent=i, origin=IntentOrigin.GROQ, confidence=0.9) for i in intents]
     )
-    return lambda text, llm=None: result
+    return lambda text, llm=None, history=(): result
+
+
+def offline_pipeline(*args, **kwargs) -> ChatPipeline:
+    """ChatPipeline con el backend simulado fijado (sin azar): bloqueo BLOCKED, transacción settled."""
+    kwargs.setdefault("block_simulator", lambda card_id: BlockStatus.BLOCKED)
+    kwargs.setdefault("transaction_simulator", lambda txn_id: TransactionStatus.SETTLED)
+    return ChatPipeline(*args, **kwargs)
 
 
 # --- Offline -----------------------------------------------------------------
@@ -154,7 +170,7 @@ def test_system_prompt_rules_are_numbered_consecutively():
 
 def test_out_of_scope_skips_retriever_and_generator():
     retriever, generator = SpyRetriever(), SpyGenerator()
-    pipeline = ChatPipeline(retriever, generator, classify_fn=_fixed_classify(Intent.FUERA_DE_ALCANCE))
+    pipeline = offline_pipeline(retriever, generator, classify_fn=_fixed_classify(Intent.FUERA_DE_ALCANCE))
 
     response = pipeline.handle(ChatRequest(session_id="s", message="hola"))
 
@@ -167,7 +183,7 @@ def test_out_of_scope_skips_retriever_and_generator():
 def test_generation_error_returns_fallback_and_escalates():
     retriever = SpyRetriever(result=[_chunk("POL-BLQ-2026-1", "regla_dura", 0.3, 2)])
     generator = SpyGenerator(error=GenerationError("boom"))
-    pipeline = ChatPipeline(retriever, generator, classify_fn=_fixed_classify(Intent.BLOQUEAR_TARJETA))
+    pipeline = offline_pipeline(retriever, generator, classify_fn=_fixed_classify(Intent.BLOQUEAR_TARJETA))
 
     response = pipeline.handle(ChatRequest(session_id="s", message="perdí mi tarjeta"))
 
@@ -184,7 +200,7 @@ LEAKY_ANSWER = "Necesito su documento de identidad y la clave telefónica que re
 def _block_pipeline(*answers, intents=(Intent.BLOQUEAR_TARJETA,)):
     retriever = SpyRetriever(result=[_chunk("POL-BLQ-2026-1", "regla_dura", 0.3, 2)])
     generator = SpyGenerator(answers=answers)
-    return ChatPipeline(retriever, generator, classify_fn=_fixed_classify(*intents)), generator
+    return offline_pipeline(retriever, generator, classify_fn=_fixed_classify(*intents)), generator
 
 
 def test_auth_channel_guardrail_passes_clean_answer_without_retry():
@@ -227,21 +243,36 @@ def test_auth_channel_guardrail_allows_phishing_education():
 
 # --- Integración (Groq real) --------------------------------------------------
 
-requires_groq = pytest.mark.skipif(
-    get_settings().groq_api_key is None, reason="GROQ_API_KEY no configurada"
-)
+def _has_groq_key() -> bool:
+    # Una variable vacía llega como SecretStr(''), no como None: también debe saltar.
+    key = get_settings().groq_api_key
+    return key is not None and bool(key.get_secret_value().strip())
+
+
+requires_groq = pytest.mark.skipif(not _has_groq_key(), reason="GROQ_API_KEY no configurada")
 
 
 INTEGRATION_PAUSE_SECONDS = 20
 
 
 @pytest.fixture(scope="module")
-def live():
+def live(tmp_path_factory):
     real = get_pipeline()
     retriever = SpyRetriever(inner=real._retriever)
     generator = SpyGenerator(inner=real._generator)
-    pipeline = ChatPipeline(retriever, generator, classifier_llm=real._classifier_llm, verifier=real._verifier)
+    pipeline = ChatPipeline(
+        retriever,
+        generator,
+        classifier_llm=real._classifier_llm,
+        verifier=real._verifier,
+        # Estados fijos: los estados del backend simulado se prueban en tests dedicados.
+        block_simulator=lambda card_id: BlockStatus.BLOCKED,
+        transaction_simulator=lambda txn_id: TransactionStatus.SETTLED,
+    )
+    # Base temporal: los tests no escriben en data/chat.db.
+    store = ChatStore(tmp_path_factory.mktemp("chat") / "chat.db")
     app.dependency_overrides[get_pipeline] = lambda: pipeline
+    app.dependency_overrides[get_chat_store] = lambda: store
     client = TestClient(app)
     cache: dict[str, dict] = {}
     calls: dict[str, tuple[int, int]] = {}
@@ -256,7 +287,10 @@ def live():
                 time.sleep(INTEGRATION_PAUSE_SECONDS)
             sent["count"] += 1
             before = (retriever.calls, generator.calls)
-            response = client.post("/api/v1/chat", json={"session_id": "test", "message": question})
+            # Una sesión nueva por envío: con historial activo, compartir la sesión haría que
+            # cada pregunta arrastre el contexto de las anteriores.
+            session_id = f"test-{sent['count']}"
+            response = client.post("/api/v1/chat", json={"session_id": session_id, "message": question})
             assert response.status_code == 200, response.text
             if fresh:
                 return response.json()
@@ -267,6 +301,7 @@ def live():
     ask.calls = calls
     yield ask
     app.dependency_overrides.pop(get_pipeline, None)
+    app.dependency_overrides.pop(get_chat_store, None)
 
 
 def _citation_ids(body: dict) -> list[str]:
@@ -279,6 +314,10 @@ KNOWN_GUARDRAILS = {
     GUARDRAIL_AUTH_CHANNEL,
     GUARDRAIL_UNSUPPORTED_CLAIM,
     FAITHFULNESS_UNVERIFIED,
+    GUARDRAIL_BLOCK_STATUS_MISMATCH,
+    GUARDRAIL_FORMAL_CASE_WHILE_PENDING,
+    TRANSACTION_PENDING_HOLD,
+    GUARDRAIL_STATE_DROPPED_AFTER_RETRY,
 }
 
 
@@ -288,15 +327,32 @@ def test_contract_for_base_questions(live, question):
     # Contrato del payload. Que un guardrail corrija una respuesta es un resultado válido, así
     # que no se exige guardrail_triggered vacío: solo que traiga nombres conocidos.
     body = live(question)
-    assert body["session_id"] == "test"
+    assert body["session_id"].startswith("test-")
     assert body["answer"].strip()
-    assert body["action"] is None
     assert set(body["guardrail_triggered"]) <= KNOWN_GUARDRAILS, body["guardrail_triggered"]
     if body["source"] == "kb":
         assert body["citations"], "una respuesta de la KB debe traer citations"
+        _assert_live_action_shape(body["action"])
     else:
         assert body["source"] == "static" and body["citations"] == []
         assert body["guardrail_triggered"] == [], "un mensaje fijo sin RAG no pasa por guardrails"
+        assert body["action"] is None, "un mensaje fijo sale antes del backend simulado"
+
+
+def _assert_live_action_shape(action: Optional[dict]) -> None:
+    """action es opcional: aparece si el clasificador detectó fraude (consulta de la transacción)
+    o si el turno ejecutó un bloqueo. Los estados son los que fija el fixture `live`."""
+    if action is None:
+        return
+    assert action["name"] in {"check_transaction_status", "block_card"}, action
+    assert action["reference_id"] is None, action
+    assert action["detail"], action
+    if action["name"] == "check_transaction_status":
+        assert action["status"] == TransactionStatus.SETTLED.value, action
+        assert action["success"] is True, action
+    else:
+        assert action["status"] == BlockStatus.BLOCKED.value, action
+        assert action["success"] is True, action
 
 
 # Preguntas cuyas respuestas se confirmaron fieles contra Groq real (diagnóstico de los falsos

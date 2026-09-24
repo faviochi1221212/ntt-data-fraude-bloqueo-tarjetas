@@ -8,7 +8,7 @@ El resultado final es la unión de ambas capas, sin duplicados.
 
 import json
 import logging
-from typing import Any, Optional, Protocol
+from typing import Any, Optional, Protocol, Sequence
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -74,7 +74,19 @@ class GroqClassification(BaseModel):
 
 
 class LLMClassifier(Protocol):
-    def classify(self, text: str) -> GroqClassification: ...
+    def classify(self, text: str, history: Sequence[tuple[str, str]] = ()) -> GroqClassification: ...
+
+
+def format_classifier_input(text: str, history: Sequence[tuple[str, str]] = ()) -> str:
+    """Mensaje para el classifier: el mensaje actual, con los turnos anteriores como contexto.
+
+    Se clasifica el mensaje ACTUAL; el historial solo ayuda a entender referencias ("sí, eso",
+    "mi documento es ..." después de que el asistente pidió datos para un bloqueo).
+    """
+    if not history:
+        return text
+    turns = "\n".join(f"{'Cliente' if role == 'user' else 'Asistente'}: {content}" for role, content in history)
+    return f"Turnos anteriores (solo contexto):\n{turns}\n\nMensaje actual a clasificar:\n{text}"
 
 
 def parse_groq_output(content: Optional[str]) -> GroqClassification:
@@ -134,7 +146,7 @@ class GroqClassifier:
         )
         self._model = settings.groq_model
 
-    def classify(self, text: str) -> GroqClassification:
+    def classify(self, text: str, history: Sequence[tuple[str, str]] = ()) -> GroqClassification:
         from groq import GroqError
 
         try:
@@ -142,7 +154,7 @@ class GroqClassifier:
                 model=self._model,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": text},
+                    {"role": "user", "content": format_classifier_input(text, history)},
                 ],
                 response_format={
                     "type": "json_schema",
@@ -161,9 +173,12 @@ class GroqClassifier:
         return parse_groq_output(response.choices[0].message.content)
 
 
-def classify(text: str, llm: Optional[LLMClassifier] = None) -> ClassificationResult:
+def classify(
+    text: str, llm: Optional[LLMClassifier] = None, history: Sequence[tuple[str, str]] = ()
+) -> ClassificationResult:
     """Clasifica combinando hard_triggers (siempre) con Groq (unión, sin duplicados).
 
+    Los hard_triggers miran solo el mensaje actual; Groq recibe además el historial como contexto.
     Si la capa Groq falla, se devuelven igual los hard_triggers y el motivo en `llm_error`.
     """
     combined: dict[Intent, ClassifiedIntent] = {
@@ -174,7 +189,8 @@ def classify(text: str, llm: Optional[LLMClassifier] = None) -> ClassificationRe
     llm_error: Optional[str] = None
     groq_result = GroqClassification(intents=[])
     try:
-        groq_result = (llm or GroqClassifier()).classify(text)
+        classifier = llm or GroqClassifier()
+        groq_result = classifier.classify(text, history) if history else classifier.classify(text)
     except LLMClassifierError as exc:
         llm_error = str(exc)
 

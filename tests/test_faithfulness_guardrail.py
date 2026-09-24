@@ -33,7 +33,7 @@ from app.guardrails.response_validators import (
 from app.models.schemas import ChatRequest, Chunk, Intent
 from app.orchestrator.pipeline import OUT_OF_SCOPE_ANSWER, ChatPipeline
 from app.rag.retriever import RetrievedChunk
-from tests.test_chat_endpoint import SpyGenerator, SpyRetriever, _fixed_classify
+from tests.test_chat_endpoint import SpyGenerator, SpyRetriever, _fixed_classify, offline_pipeline
 
 REP_2 = RetrievedChunk(
     chunk=Chunk(
@@ -67,10 +67,12 @@ class FakeVerifier:
         self.error = error
         self.calls = []
         self.messages = []
+        self.facts = []
 
-    def verify(self, answer, chunks, user_message=""):
+    def verify(self, answer, chunks, user_message="", system_facts=()):
         self.calls.append(answer)
         self.messages.append(user_message)
+        self.facts.append(system_facts)
         if self.error:
             raise FaithfulnessVerifierError("429")
         claims = self.unsupported.get(answer)
@@ -79,7 +81,7 @@ class FakeVerifier:
 
 def _pipeline(*answers, verifier, intents=(Intent.SOLICITAR_TARJETA_NUEVA,), chunks=(REP_2,)):
     generator = SpyGenerator(answers=answers)
-    pipeline = ChatPipeline(
+    pipeline = offline_pipeline(
         SpyRetriever(result=list(chunks)), generator, classify_fn=_fixed_classify(*intents), verifier=verifier
     )
     return pipeline, generator
