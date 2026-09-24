@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     )
 
     # Aplicación
-    app_name: str = "fraud-assistant"
+    app_name: str = "Centinela"
     app_env: Literal["local", "dev", "staging", "prod"] = "local"
     log_level: str = "INFO"
 
@@ -40,7 +40,10 @@ class Settings(BaseSettings):
     rag_top_k: int = 4
     rag_min_score: float = 0.0
 
-    # API simulada (bloqueo de tarjetas)
+    # Reservado para una futura integración con el backend transaccional real del banco.
+    # No se usa: el MVP simula el bloqueo y el estado de transacción como funciones locales
+    # en app/api/mock_backend.py (ver LIMITATIONS.md, sección
+    # "Alcance: backend transaccional simulado (mock)").
     mock_api_base_url: str = "http://localhost:8001"
 
     # Persistencia de conversaciones (SQLite)
