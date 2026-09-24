@@ -40,7 +40,7 @@ from app.rag.retriever import RetrievedChunk
 logger = logging.getLogger(__name__)
 
 OUT_OF_SCOPE_ANSWER = (
-    "Puedo ayudarte con bloqueo de tarjetas, reportes de fraude, reposición o phishing. "
+    "Soy Centinela. Puedo ayudarte con bloqueo de tarjetas, reportes de fraude, reposición o phishing. "
     "¿En qué te ayudo?"
 )
 FALLBACK_ANSWER = (

@@ -71,7 +71,7 @@ function EmptyState({ onSuggestion }: { onSuggestion: (text: string) => void }) 
       <span className="flex size-14 items-center justify-center rounded-2xl bg-primary-soft text-primary">
         <ShieldIcon className="size-7" />
       </span>
-      <h2 className="mt-5 text-xl font-semibold text-ink text-balance sm:text-2xl">¿En qué podemos ayudarte hoy?</h2>
+      <h2 className="mt-5 text-xl font-semibold text-ink text-balance sm:text-2xl">Soy Centinela. ¿En qué puedo ayudarte hoy?</h2>
       <p className="mt-2 max-w-md text-[15px] leading-6 text-ink-2 text-pretty">
         Bloquea tu tarjeta, reporta un cargo que no reconoces o consulta cómo proteger tus datos.
       </p>
